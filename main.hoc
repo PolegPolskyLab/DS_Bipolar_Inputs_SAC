@@ -1,0 +1,18 @@
+	//---load the NEURON files
+	chdir("C:/nrn/lib/hoc")
+	load_file("nrngui.hoc")
+
+	//---put the current directory here
+	chdir("D:/OneDrive - The University of Colorado Denver/simulations/SAC - Inputs/Simulation")
+	//---running NEURON only to get the morphology
+	NEURONonly=0
+	if(NEURONonly){
+		GA_pop=0
+	}else{	//---load the mechanisms
+		nrn_load_dll("nrnmech.dll")
+	}
+//------------L type calcium
+	calrgc_gbar=0.
+//------------N type calcium
+	canrgc_gbar=0.01
+	xopen("BC_SAC_Network.hoc")			//---load the actual simulation file file

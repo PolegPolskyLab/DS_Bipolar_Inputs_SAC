@@ -1,0 +1,418 @@
+/*/
+	A. load BC inputs, take into account speed, place synapses and prepare recording waves
+	B. in separate runs:
+		1. distribute BC inputs according to distribution list
+		2. run 2 directions/5 speeds
+		3. get dendritic voltages
+	in Igor:
+		C. find the best performing scenario
+		D. repopulate the distribution list
+		E. mutation - change synaptic distribution
+		F. go to B or end simulation
+	communication is triggred by 'go' and 'stop' files with the same #GA_pop (the identifier of the population
+/*/
+
+	//---select the SAC
+	SACnum=1		
+	if(SACnum==0){load_file("Cell.hoc")}
+	if(SACnum==1){load_file("SAC1.hoc")}
+	if(SACnum==2){load_file("SAC2.hoc")}
+	if(SACnum==3){load_file("SAC3.hoc")}
+	if(SACnum==4){load_file("SAC4.hoc")}
+	
+	//---the SAC
+	objref SAC 
+	SAC=new star(0,0)	//---new cell at location x=0,y=0
+	//---default parametrs (not used in most cases)
+	forall {
+		insert pas
+		g_pas=4e-4
+		e_pas=-60
+		Ra=150
+	}
+	access SAC.soma
+	xopen("GA_SAC.ses")
+	
+//---there parametrs change depending on the simulation
+GA_numClusters=2	//---number of BC clusters 
+
+//---general params of the GA models
+GA_numGen=10		//---number of generations
+GA_PopSize=10		//---population size	
+//---specific params
+GA_numSpeeds=5		//---number of tested speeds
+GA_tStop=5000		//---stop time
+GA_timePnts=305		//---time points in experimental waves
+GA_numSyn=200		//---number of synapses
+GA_SynGain=.03		//---synaptic conductance
+//---distribution information
+
+//---speed list
+double Speeds[GA_numSpeeds]
+Speeds[0]=.25
+Speeds[1]=.5
+Speeds[2]=1
+Speeds[3]=2
+Speeds[4]=4
+
+//---bipolar waveforms
+double BC_Time_data[GA_timePnts][GA_numClusters][GA_numSpeeds]
+
+
+objref BC_matrix,xFile,Dist_List,imp
+objref ExcSyn_List,VEC_ExcVinf,Synapses,TempSyn,TempG,rand,TempR
+objref Vdir1,Vdir2
+Vdir1=new Vector()
+Vdir2=new Vector()
+objref RecV_List,RecV_X,RecV_Y
+
+
+//---compute and save impedance all over the cell
+proc calc_impedance(){
+	//---selected dendrite
+	forall nseg=11
+	access SAC.dend[68]						//---different for each cell
+	imp=new Impedance()
+	imp.loc(.5)
+	imp.compute(0)
+	xFile=new File()
+	xFile.wopen("waves/impedance.dat")
+	forall{
+		for i=0,n3d()-1{
+			xFile.printf("%g	%g	%g\n",x3d(i),y3d(i),imp.ratio(i/n3d()))
+		}
+		print imp.ratio(0)
+		xFile.printf("\n")
+	}
+	xFile.close()
+	print "done saving impedance"
+}
+//---------------------------------------------------------------------------------------------------------------//
+//					load BC inputs, take into account speed, place synapses and prepare recording waves
+//---------------------------------------------------------------------------------------------------------------//
+
+
+//---save morphology of the cell (important for igor to determine synaptic locations
+proc SaveMorphology(){
+	xFile=new File()
+	strdef st
+	sprint(st,"waves/MorphFull%d.dat",GA_pop)	//---full morphology - used in illustrations
+	xFile.wopen(st)
+	dend=0
+	forall{
+		for i=0,n3d()-1{
+			xFile.printf("%g	%g	%d\n",x3d(i),y3d(i),dend)
+		}
+		xFile.printf("\n")
+		dend+=1
+	}
+	xFile.close()
+	xFile=new File()
+	sprint(st,"waves/MorphInput%d.dat",GA_pop)	//---just the dendrites that get the BC inputs
+	xFile.wopen(st)
+	dend=0
+	forsec SAC.InputDends{
+		for i=0,n3d()-1{
+			xFile.printf("%g	%g	%d\n",x3d(i),y3d(i),dend)
+		}
+		xFile.printf("\n")
+		dend+=1
+	}
+	xFile.close()	
+	xFile=new File()
+	sprint(st,"waves/MorphLength%d.dat",GA_pop)
+	xFile.wopen(st)
+	forsec SAC.InputDends{
+		xFile.printf("%g\n",L)
+	}
+	xFile.close()
+	print st
+	print "done saving morphology ",GA_pop
+}
+	
+//---load the time waves of different BC clusters
+proc GA_LoadBCInputSpeed(){
+	BC_matrix=new Matrix()	//---for ease of access. used to load data
+	Dist_List=new Matrix()
+	xFile=new File()
+	strdef st 
+	for vel=0,GA_numSpeeds-1{
+		sprint(st,"waves/SynapsesDrive_%d_%d.dat",vel,GA_pop)
+		xFile.ropen(st)
+		BC_matrix.scanf(xFile,GA_timePnts,GA_numClusters)
+		xFile.close()
+		//---place the data into double array which is used to store the waveforms 
+		for tt=0,GA_timePnts-1{
+			for cl=0,GA_numClusters-1{
+				BC_Time_data[tt][cl][vel]=BC_matrix.x[tt][cl]
+			}
+		}			
+	}
+	GA_loadBCTypes()
+}
+
+//---load synaptic types, for example, the proximal/distal BC distinction
+proc GA_loadBCTypes(){
+	strdef st	
+	xFile.ropen("waves/Types.dat")
+	Dist_List.scanf(xFile,GA_numSyn,GA_PopSize)
+	xFile.close()
+}
+objref Synapses,mGluR2Syn_List
+
+//---load parametrs of active and voltage gated channels
+proc GA_loadPassiveActiveProperties(){
+	strdef st
+	sprint(st,"waves/PassiveActive_%d.hoc",GA_pop)
+	xopen(st)
+
+	for i=0,ExcSyn_List.count()-1{
+		ExcSyn_List.o(i).gain=GA_SynGain
+		//---uncomment when only one dend is stimulated
+		// if(atan2(ExcSyn_List.o(i).postY,ExcSyn_List.o(i).postX)>0.4){ExcSyn_List.o(i).gain=0}
+		// if(atan2(ExcSyn_List.o(i).postY,ExcSyn_List.o(i).postX)<-0.63){ExcSyn_List.o(i).gain=0}
+	}	
+}
+
+//---distribute the BC inputs
+proc GA_CreateSynapses(){
+	ExcSyn_List=new List()			//---bipolar inputs
+	VEC_ExcVinf=new List()
+	mGluR2Syn_List=new List()
+	//---load synapse locations
+	Synapses=new Matrix()
+	xFile=new File()
+	xFile=new File()
+	sprint(st,"waves/Synapses%d.dat",0*GA_pop)
+
+	xFile.ropen(st)
+	Synapses.scanf(xFile,GA_numSyn,4)	//--- PostX,PostY,BC type,dend #, dend position
+	xFile.close()
+	for countn=0,GA_numSyn-1{
+		dend=0
+		forsec SAC.InputDends{
+			if(dend==Synapses.x[countn][2]){
+				//---BC synapse
+				TempSyn=new SynVec(Synapses.x[countn][3])
+				TempSyn.postX=Synapses.x[countn][0]
+				TempSyn.postY=Synapses.x[countn][1]
+
+				TempSyn.gain=GA_SynGain
+				
+				ExcSyn_List.append(TempSyn)
+				//---the bipolar waveform played into the synaptic conductance
+				TempG=new Vector(GA_timePnts)
+				TempG.play(&ExcSyn_List.o(ExcSyn_List.count()-1).g,19.5637)
+				VEC_ExcVinf.append(TempG)
+
+			}
+			dend+=1
+		}
+	}
+}
+
+//---distribute active conductances
+proc GA_SetActive(){
+	if (calrgc_gbar>0){
+		forall{
+			insert calrgc
+			gbar_calrgc=calrgc_gbar
+		}
+	}
+	if (canrgc_gbar>0){
+		forall{
+			insert canrgc
+			gbar_canrgc=canrgc_gbar
+		}
+	}
+	if ((calrgc_gbar>0)||(canrgc_gbar>0)){
+		forall{
+			insert cadiff
+		}
+	}
+}
+
+objref recCAdend,recVdend,recSoma
+
+//---prepare recording waves - the output of the simulation
+proc GA_makeRecordingWaves(){
+	RecV_List=new List()
+	RecV_X=new Vector()
+	RecV_Y=new Vector()
+	recCAdend=new Vector()
+	recVdend=new Vector()
+	recSoma=new Vector()
+	if ((calrgc_gbar>0)||(canrgc_gbar>0)){
+		recCAdend.record(&SAC.dend[SAC.recDendNum].cai(.5),1)
+	}
+	recVdend.record(&SAC.dend[SAC.recDendNum].v(.5),1)
+	recSoma.record(&SAC.soma.v(.5),1)
+	
+	forsec SAC.OutputDends{
+		TempR=new Vector()
+		if ((calrgc_gbar>0)||(canrgc_gbar>0)){
+			TempR.record(&cai(.5),1)
+		}else{
+			TempR.record(&v(.5),1)
+		}
+		RecV_List.append(TempR)
+		dist=0
+		i=1
+
+		while ((dist<L*.5)&&(i<n3d()-1)){
+			dist+=((x3d(i)-x3d(i-1))^2+(y3d(i)-y3d(i-1))^2)^0.5
+			i+=1
+		}
+
+			
+		RecV_X.append(x3d(i))
+		RecV_Y.append(y3d(i))
+	}
+
+}
+//---measure peak responses from recording waves
+proc GA_measureRecordingWaves(){	//---$o1 a vector to save the results, $2 speed, $3 dir,$4 pop,$5 contrast
+	$o1.resize(RecV_List.count())
+	for i=0,RecV_List.count()-1{
+		$o1.x[i]=RecV_List.o(i).max()-RecV_List.o(i).x[100]//+60*(calrgc_gbar==0)	//--- -60 is the resting membrane potential
+	}
+	//---save example voltages to file
+	strdef st
+	sprint(st,"waves/ExampleV%d_%d_%d_%d.dat",$2,$3,$4,$5)
+	xFile=new File()
+	xFile.wopen(st)
+	recVdend.printf(xFile)
+	xFile.close()
+	sprint(st,"waves/ExampleSoma%d_%d_%d_%d.dat",$2,$3,$4,$5)
+	xFile=new File()
+	xFile.wopen(st)
+	recSoma.printf(xFile)
+	xFile.close()
+	if ((calrgc_gbar>0)||(canrgc_gbar>0)){
+		sprint(st,"waves/ExampleCA%d_%d_%d_%d.dat",$2,$3,$4,$5)
+		xFile=new File()
+		xFile.wopen(st)
+		recCAdend.printf(xFile)
+		xFile.close()
+
+	}
+}
+
+//---assign synaptic waveforms to each synapse
+proc GA_SetSynapses(){	//---$1 is location in population $2 speed, $3 contrast , $4 direction [1,-1]
+	for syn=0,GA_numSyn-1{
+		for tt=0,GA_timePnts-1{
+			VEC_ExcVinf.o(syn).x[tt]=0
+			offset=tt+int(ExcSyn_List.o(syn).postX/Speeds[$2]*$4/19.5637)+(100+300*($2==0)+300*($2==1)+200*($2==2))/19.5637
+			if((offset>=0)&&(offset<GA_timePnts)){
+				VEC_ExcVinf.o(syn).x[tt]=BC_Time_data[offset][Dist_List.x[syn][GA_pop]][$2]*$3/100			
+			}
+		}
+	}
+}
+
+//---------------------------------------------------------------------------------------------------------------//
+//					Simulation run
+//---------------------------------------------------------------------------------------------------------------//
+
+
+//---begin simulation run
+proc GA_RunSimSpeed(){		//---$1 cell number (pop) $2 speed $3 contrast
+	//---load BC types, stimuli, postsynaptic properties
+	GA_loadBCTypes()
+	GA_LoadBCInputSpeed()
+	GA_loadPassiveActiveProperties()
+
+	//---place synaptic waves in one direction
+	GA_SetSynapses($1,$2,$3,-1)
+	run()
+	GA_measureRecordingWaves(Vdir1,$2,0,$1,$3)
+	//---place synaptic waves in the other direction
+	GA_SetSynapses($1,$2,$3,1)
+	run()
+	GA_measureRecordingWaves(Vdir2,$2,1,$1,$3)
+	//---save the results
+	xFile=new File()
+	strdef st
+	sprint(st,"waves/Output%d_%d_%d.dat",$1,$2,$3)
+	xFile.wopen(st)
+	for dend=0,RecV_X.size()-1{
+		xFile.printf("%g	%g	%g	%g	%g\n",RecV_X.x[dend],RecV_Y.x[dend],Vdir1.x[dend],Vdir2.x[dend],recSoma.max()+60)
+	}
+	xFile.close()
+	xFile=new File()
+	sprint(st,"waves/OutputDone%d_%d_%d.dat",$1,$2,$3)
+	xFile.wopen(st)
+	xFile.printf("0")	//---to let Igor know that the simulation is concluded
+	xFile.close()
+	print st	//---progress update 
+}
+
+
+//---execute a single run
+proc runSAC(){
+	while(1){
+		//---wait for go command
+		strdef st,stopSt
+		sprint(st,"waves/Go%d",GA_pop)
+		sprint(stopSt,"waves/Stop%d",GA_pop)
+		stopGA=0
+		while(1){	
+			if(ropen(stopSt)){
+				stopGA=1 
+				break
+			}
+			if(ropen(st)){break}			
+		}
+		ropen()
+		//---delete the go file (so that Igor will create it in the next generation
+		sprint(st,"\"rm waves/Go%d\"",GA_pop)
+		system(st)
+		if(stopGA){break}
+			//---optional contrast, uncomment the for loop
+		contrast=100
+		//for (contrast=40;contrast<=100;contrast+=30){
+			for speed=0,GA_numSpeeds-1{
+				// speed=1
+				tstop=500
+				if(speed==0){
+					tstop=2200
+				}else{
+					if(speed==1){
+						tstop=1000
+					}
+					if(speed==2){
+						tstop=700
+					}
+				}
+				tstop+=1000
+				dt=0.1
+				setdt()
+				tstop_changed()
+
+				GA_RunSimSpeed(GA_pop,speed,contrast)
+			}
+		//}	//---contrast
+		
+	}
+}
+
+SaveMorphology()
+
+if(NEURONonly==0){
+	GA_LoadBCInputSpeed()
+	GA_CreateSynapses()
+	GA_SetActive()
+	GA_makeRecordingWaves()
+
+	tstop=5000
+	dt=0.1
+	tstop_changed()
+	//---uncomment to measure impedance
+	//calc_impedance()
+	//---uncomment to run just one speed
+	//GA_RunSimSpeed(GA_pop,1,100)
+
+	runSAC()
+	quit()
+}
