@@ -1,5 +1,6 @@
 # DS_Bipolar_Inputs_SAC
 NEURON model and Igor files with experimental data and evolutionary algorithms
+CITE AS: eLife2023;12:RP90456 DOI: https://doi.org/10.7554/eLife.90456.3
 
 IMPORTANT!
 
